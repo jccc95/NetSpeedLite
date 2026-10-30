@@ -6,6 +6,151 @@ private struct SpeedSample {
     let upload: Double
 }
 
+private struct ProcessTrafficRate {
+    let name: String
+    let download: Double
+    let upload: Double
+
+    var total: Double { download + upload }
+}
+
+private final class ProcessTrafficMonitor {
+    var onUpdate: (([ProcessTrafficRate], Bool) -> Void)?
+
+    private let parsingQueue = DispatchQueue(label: "local.codex.netspeedlite.nettop")
+    private var process: Process?
+    private var outputHandle: FileHandle?
+    private var pendingData = Data()
+    private var sample: [String: ProcessTrafficRate] = [:]
+    private var hasSeenHeader = false
+    private var isFirstSample = true
+    private var isStopping = false
+
+    func start() {
+        guard process == nil else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        process.arguments = [
+            "-q", "/dev/null", "/usr/bin/nettop", "-P", "-n", "-x", "-c", "-d",
+            "-l", "0", "-J", "bytes_in,bytes_out"
+        ]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        outputHandle = pipe.fileHandleForReading
+        outputHandle?.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            self?.consume(data)
+        }
+        process.terminationHandler = { [weak self] terminatedProcess in
+            guard let self, !self.isStopping else { return }
+            DispatchQueue.main.async {
+                self.onUpdate?([], false)
+                NSLog("NetSpeedLite: nettop exited with status %d", terminatedProcess.terminationStatus)
+            }
+        }
+
+        do {
+            try process.run()
+            self.process = process
+        } catch {
+            outputHandle?.readabilityHandler = nil
+            onUpdate?([], false)
+            NSLog("NetSpeedLite: couldn't start nettop: %@", error.localizedDescription)
+        }
+    }
+
+    func stop() {
+        isStopping = true
+        outputHandle?.readabilityHandler = nil
+        if process?.isRunning == true { process?.terminate() }
+        process = nil
+        outputHandle = nil
+    }
+
+    private func consume(_ data: Data) {
+        parsingQueue.async { [weak self] in
+            guard let self else { return }
+            self.pendingData.append(data)
+            while let newline = self.pendingData.firstIndex(of: 0x0A) {
+                var lineData = self.pendingData.prefix(upTo: newline)
+                self.pendingData.removeSubrange(...newline)
+                if lineData.last == 0x0D { lineData = lineData.dropLast() }
+                let line = String(decoding: lineData, as: UTF8.self)
+                self.consumeLine(line)
+            }
+        }
+    }
+
+    private func consumeLine(_ rawLine: String) {
+        let line = String(rawLine.unicodeScalars.filter {
+            !CharacterSet.controlCharacters.contains($0)
+        }).trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty else { return }
+        if line.contains("bytes_in") && line.contains("bytes_out") {
+            if hasSeenHeader {
+                finishSample()
+            } else {
+                hasSeenHeader = true
+            }
+            return
+        }
+
+        guard let match = Self.rowRegex.firstMatch(
+            in: line,
+            range: NSRange(line.startIndex..., in: line)
+        ),
+        let nameRange = Range(match.range(at: 1), in: line),
+        let receivedRange = Range(match.range(at: 3), in: line),
+        let sentRange = Range(match.range(at: 4), in: line),
+        let received = Double(line[receivedRange]),
+        let sent = Double(line[sentRange]) else { return }
+
+        let name = String(line[nameRange]).trimmingCharacters(in: .whitespaces)
+        let previous = sample[name]
+        sample[name] = ProcessTrafficRate(
+            name: name,
+            download: (previous?.download ?? 0) + received,
+            upload: (previous?.upload ?? 0) + sent
+        )
+    }
+
+    private func finishSample() {
+        if isFirstSample {
+            isFirstSample = false
+            sample.removeAll(keepingCapacity: true)
+            DispatchQueue.main.async { self.onUpdate?([], true) }
+            return
+        }
+
+        let topRates = sample.values
+            .filter { $0.total > 0 }
+            .sorted { $0.total > $1.total }
+            .prefix(5)
+        let rates = Array(topRates)
+        sample.removeAll(keepingCapacity: true)
+        DispatchQueue.main.async { self.onUpdate?(rates, true) }
+    }
+
+    private static let rowRegex = try! NSRegularExpression(
+        pattern: #"^(.+)\.(\d+)\s+(\d+)\s+(\d+)\s*$"#
+    )
+}
+
+private func formatRate(_ bytesPerSecond: Double) -> String {
+    if bytesPerSecond >= 1_000_000 {
+        return String(format: "%.1fMB/s", bytesPerSecond / 1_000_000)
+    }
+    if bytesPerSecond >= 1_000 {
+        return String(format: "%.0fKB/s", bytesPerSecond / 1_000)
+    }
+    return String(format: "%.0fB/s", bytesPerSecond)
+}
+
 private enum LaunchAgentManager {
     private static let label = "local.codex.netspeedlite"
     private static let launchAgentURL = FileManager.default.homeDirectoryForCurrentUser
@@ -149,10 +294,12 @@ private final class PopoverViewController: NSViewController {
     private let chart = SpeedChartView()
     private let downloadLabel = NSTextField(labelWithString: "↓ 下载 0B/s")
     private let uploadLabel = NSTextField(labelWithString: "↑ 上传 0B/s")
+    private let processStatusLabel = NSTextField(labelWithString: "正在读取进程流量…")
+    private let processRows = NSStackView()
     private let startupButton = NSButton(checkboxWithTitle: "登录时启动", target: nil, action: nil)
 
     override func loadView() {
-        let rootView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let rootView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 360))
         let heading = NSTextField(labelWithString: "实时网速")
         heading.font = .systemFont(ofSize: 13, weight: .semibold)
         let period = NSTextField(labelWithString: "最近 60 秒")
@@ -173,7 +320,16 @@ private final class PopoverViewController: NSViewController {
         ratesRow.spacing = 8
 
         chart.translatesAutoresizingMaskIntoConstraints = false
-        chart.heightAnchor.constraint(equalToConstant: 128).isActive = true
+        chart.heightAnchor.constraint(equalToConstant: 104).isActive = true
+
+        let processHeading = NSTextField(labelWithString: "应用 / 进程实时网速（前 5）")
+        processHeading.font = .systemFont(ofSize: 11, weight: .semibold)
+        processStatusLabel.font = .systemFont(ofSize: 10)
+        processStatusLabel.textColor = .secondaryLabelColor
+        processRows.orientation = .vertical
+        processRows.alignment = .leading
+        processRows.spacing = 3
+        processRows.translatesAutoresizingMaskIntoConstraints = false
         startupButton.target = self
         startupButton.action = #selector(toggleStartup(_:))
         startupButton.state = LaunchAgentManager.isEnabled ? .on : .off
@@ -184,10 +340,12 @@ private final class PopoverViewController: NSViewController {
         footer.orientation = .horizontal
         footer.distribution = .equalSpacing
 
-        let stack = NSStackView(views: [headingRow, ratesRow, chart, footer])
+        let stack = NSStackView(views: [
+            headingRow, ratesRow, processHeading, processStatusLabel, processRows, chart, footer
+        ])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 11
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
         rootView.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -197,17 +355,57 @@ private final class PopoverViewController: NSViewController {
             stack.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -14),
             headingRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             ratesRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            processRows.widthAnchor.constraint(equalTo: stack.widthAnchor),
             chart.widthAnchor.constraint(equalTo: stack.widthAnchor),
             footer.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         view = rootView
     }
 
-    func update(samples: [SpeedSample], download: String, upload: String) {
+    func update(
+        samples: [SpeedSample],
+        download: String,
+        upload: String,
+        processRates: [ProcessTrafficRate],
+        processMonitorAvailable: Bool
+    ) {
         loadViewIfNeeded()
         chart.samples = samples
         downloadLabel.stringValue = "↓ 下载 \(download)/s"
         uploadLabel.stringValue = "↑ 上传 \(upload)/s"
+        for row in processRows.views { processRows.removeView(row) }
+
+        guard processMonitorAvailable else {
+            processStatusLabel.stringValue = "进程流量统计不可用"
+            return
+        }
+        guard !processRates.isEmpty else {
+            processStatusLabel.stringValue = "暂无活跃进程流量（代理 / VPN 可能单独显示）"
+            return
+        }
+
+        processStatusLabel.stringValue = ""
+        for rate in processRates {
+            let nameLabel = NSTextField(labelWithString: rate.name)
+            nameLabel.font = .systemFont(ofSize: 10)
+            nameLabel.lineBreakMode = .byTruncatingTail
+            nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+            let rateLabel = NSTextField(labelWithString:
+                "↓ \(formatRate(rate.download))  ↑ \(formatRate(rate.upload))"
+            )
+            rateLabel.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
+            rateLabel.alignment = .right
+            rateLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+            let row = NSStackView(views: [nameLabel, rateLabel])
+            row.orientation = .horizontal
+            row.distribution = .fill
+            row.alignment = .firstBaseline
+            row.spacing = 6
+            row.widthAnchor.constraint(equalTo: processRows.widthAnchor).isActive = true
+            processRows.addArrangedSubview(row)
+        }
     }
 
     @objc private func toggleStartup(_ sender: NSButton) {
@@ -228,6 +426,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusView: StatusBarView!
     private var popover: NSPopover!
     private var popoverController: PopoverViewController!
+    private let processTrafficMonitor = ProcessTrafficMonitor()
+    private var processRates: [ProcessTrafficRate] = []
+    private var processMonitorAvailable = true
     private var timer: Timer?
     private var previous: (received: UInt64, sent: UInt64, time: TimeInterval)?
     private var samples: [SpeedSample] = []
@@ -248,10 +449,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popoverController.onQuit = { NSApp.terminate(nil) }
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 320, height: 240)
+        popover.contentSize = NSSize(width: 320, height: 360)
         popover.contentViewController = popoverController
 
         enableStartupOnFirstRun()
+        processTrafficMonitor.onUpdate = { [weak self] rates, isAvailable in
+            self?.processRates = rates
+            self?.processMonitorAvailable = isAvailable
+            self?.updatePopoverIfVisible()
+        }
+        processTrafficMonitor.start()
         sampleNetwork()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.sampleNetwork()
@@ -260,6 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        processTrafficMonitor.stop()
     }
 
     private func togglePopover() {
@@ -268,6 +476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
         } else {
             popover.show(relativeTo: statusView.bounds, of: statusView, preferredEdge: .minY)
+            updatePopoverIfVisible()
         }
     }
 
@@ -337,7 +546,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let download = format(downloadRate)
         let upload = format(uploadRate)
         updateStatusDisplay(download: download, upload: upload)
-        popoverController.update(samples: samples, download: download, upload: upload)
+        updatePopoverIfVisible(download: download, upload: upload)
+    }
+
+    private func updatePopoverIfVisible(download: String? = nil, upload: String? = nil) {
+        guard popover.isShown else { return }
+        popoverController.update(
+            samples: samples,
+            download: download ?? format(downloadRate),
+            upload: upload ?? format(uploadRate),
+            processRates: processRates,
+            processMonitorAvailable: processMonitorAvailable
+        )
     }
 
     private func updateStatusDisplay(download: String, upload: String) {
