@@ -25,7 +25,7 @@
 ## 编译和运行
 
 ```sh
-git clone https://github.com/<你的账号>/NetSpeedLite.git
+git clone https://github.com/jccc95/NetSpeedLite.git
 cd NetSpeedLite
 ./build.sh
 open build/NetSpeedLite.app

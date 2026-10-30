@@ -25,7 +25,7 @@ No third-party packages are required.
 ## Build and run
 
 ```sh
-git clone https://github.com/<your-account>/NetSpeedLite.git
+git clone https://github.com/jccc95/NetSpeedLite.git
 cd NetSpeedLite
 ./build.sh
 open build/NetSpeedLite.app
