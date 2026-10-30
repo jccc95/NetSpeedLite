@@ -14,6 +14,7 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 cp "$PROJECT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
 swiftc \
+  -target "$(uname -m)-apple-macosx13.0" \
   -module-cache-path "$CACHE_DIR" \
   -O \
   -framework AppKit \

@@ -213,12 +213,9 @@ private final class StatusBarView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .left
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium),
-            .foregroundColor: NSColor.labelColor,
-            .paragraphStyle: paragraph
+            .foregroundColor: NSColor.labelColor
         ]
         let lineHeight: CGFloat = 10
         (downloadText as NSString).draw(
@@ -369,7 +366,6 @@ private final class PopoverViewController: NSViewController {
         processRates: [ProcessTrafficRate],
         processMonitorAvailable: Bool
     ) {
-        loadViewIfNeeded()
         chart.samples = samples
         downloadLabel.stringValue = "↓ 下载 \(download)/s"
         uploadLabel.stringValue = "↑ 上传 \(upload)/s"
@@ -403,8 +399,8 @@ private final class PopoverViewController: NSViewController {
             row.distribution = .fill
             row.alignment = .firstBaseline
             row.spacing = 6
-            row.widthAnchor.constraint(equalTo: processRows.widthAnchor).isActive = true
             processRows.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: processRows.widthAnchor).isActive = true
         }
     }
 
@@ -481,10 +477,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func enableStartupOnFirstRun() {
-        let preferences = UserDefaults(suiteName: "local.codex.netspeedlite")!
+        let preferences = UserDefaults.standard
         let configurationKey = "launchAtLoginConfigured"
         guard preferences.object(forKey: configurationKey) == nil else { return }
-        if setLaunchAtLogin(true) {
+        if LaunchAgentManager.isEnabled || setLaunchAtLogin(true) {
             preferences.set(true, forKey: configurationKey)
         }
     }
@@ -492,8 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setLaunchAtLogin(_ enabled: Bool) -> Bool {
         do {
             try LaunchAgentManager.setEnabled(enabled, appURL: appBundleURL())
-            UserDefaults(suiteName: "local.codex.netspeedlite")?
-                .set(true, forKey: "launchAtLoginConfigured")
+            UserDefaults.standard.set(true, forKey: "launchAtLoginConfigured")
             return true
         } catch {
             NSLog("NetSpeedLite: couldn't update login startup: %@", error.localizedDescription)
